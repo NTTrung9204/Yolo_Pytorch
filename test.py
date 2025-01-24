@@ -6,4 +6,4 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = YOLOV1Model(7, 5, 2).to(device)
 
-summary(model, input_size=(3, 448, 488), batch_size=128)
+summary(model, input_size=(3, 448, 448), batch_size=128)
