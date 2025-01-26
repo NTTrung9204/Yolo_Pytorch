@@ -2,8 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class YOLOLoss(nn.Module):
-    def __init__(self, cell_size: int, num_classes: int, num_bbox: int, lambda_coord: float = 5.0, lambda_noobj: float = 0.5) -> None:
+    def __init__(
+        self,
+        cell_size: int,
+        num_classes: int,
+        num_bbox: int,
+        lambda_coord: float = 5.0,
+        lambda_noobj: float = 0.5,
+    ) -> None:
         super(YOLOLoss, self).__init__()
 
         self.S = cell_size  # Grid size (SxS)
@@ -11,81 +19,115 @@ class YOLOLoss(nn.Module):
         self.B = num_bbox  # Number of bounding boxes per grid cell
         self.lambda_coord = lambda_coord  # Weight for Localization Loss
         self.lambda_noobj = lambda_noobj  # Weight for no-object Confidence Loss
+        self.mse = nn.MSELoss()
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Compute YOLO loss.
 
         :param predictions: Tensor of predictions, shape: [batch_size, S, S, B * 5 + C]
-        :param targets: Tensor of ground truth, shape: [batch_size, S, S, 5]
+        :param targets: Tensor of ground truth, shape: [batch_size, S, S, B * 5 + C]
         :return: Total loss
         """
-        batch_size = predictions.size(0)
+        predictions = predictions.reshape(-1, self.S, self.S, self.C + self.B * 5)
 
-        # Reshape predictions and targets
-        pred_boxes = predictions[..., :self.B * 5].reshape(batch_size, self.S, self.S, self.B, 5)  # [x, y, w, h, confidence]
-        pred_classes = predictions[..., self.B * 5:]  # Class probabilities
+        iou1 = self.calculate_iou(
+            predictions[..., self.C + 1 : self.C + 5],
+            targets[..., self.C + 1 : self.C + 5],
+        )
+        iou2 = self.calculate_iou(
+            predictions[..., self.C + 6 : self.C + 10],
+            targets[..., self.C + 1 : self.C + 5],
+        )
 
-        target_boxes = targets[..., :5].unsqueeze(3)  # [x, y, w, h, class_id]
-        target_classes = targets[..., 4].long()  # Class IDs
+        ious = torch.cat(
+            [iou1.unsqueeze(0), iou2.unsqueeze(0)], dim=0
+        )  # [[iou1],[iou2]]
 
-        # Adjust target_classes to be 0-based only for non-zero class IDs
-        target_classes_adjusted = torch.where(target_classes > 0, target_classes - 1, target_classes)
+        # bbox
+        iou_max_val, best_bbox = torch.max(ious, dim=0)
 
-        # Create one-hot encoding for adjusted target classes
-        target_classes_one_hot = F.one_hot(target_classes_adjusted, num_classes=self.C).float()
+        # print(targets[..., self.C].shape)
 
-        # Calculate IoU for each bbox
-        ious = torch.stack(
-            [self.calculate_iou(pred_boxes[..., b, :4], target_boxes[..., 0, :4]) for b in range(self.B)],
-            dim=3
-        )  # Shape: [batch_size, S, S, B]
+        # I_obj_ij
+        actual_box = targets[..., self.C].unsqueeze(
+            3
+        )  # (-1,S,S,1)
 
-        # Select the bbox with the highest IoU
-        best_iou, best_bbox = torch.max(ious, dim=3, keepdim=True)  # Shape: [batch_size, S, S, 1]
-        best_iou = best_iou.squeeze(-1)
+        # print("actual_box", actual_box[0])
 
-        # Create masks for the best bbox
-        obj_mask = (targets[..., 4] > 0).unsqueeze(-1)  # Object presence mask
-        noobj_mask = ~obj_mask  # No-object mask
-
-        best_pred_boxes = pred_boxes.gather(3, best_bbox.unsqueeze(-1).expand(-1, -1, -1, -1, 5)).squeeze(3)
-
-        obj_mask = obj_mask.squeeze(-1)
-
-        epsilon = 1e-6  # Small value to prevent invalid sqrt
-        clamped_best_pred_boxes = torch.clamp(best_pred_boxes[..., 2:4], min=epsilon)  # Ensure w, h >= epsilon
-        clamped_target_boxes = torch.clamp(target_boxes[..., 0, 2:4], min=epsilon)    # Ensure w, h >= epsilon
-
-        # Calculate (w, h) loss with clamped values
-        coord_loss = torch.sum(
-            obj_mask * (
-                torch.sum((best_pred_boxes[..., 0:2] - target_boxes[..., 0, 0:2]) ** 2, -1) +  # (x, y)
-                torch.sum((torch.sqrt(clamped_best_pred_boxes) - torch.sqrt(clamped_target_boxes)) ** 2, -1)  # (w, h)
+        # box coords
+        box_pred = actual_box * (
+            (
+                best_bbox * predictions[..., self.C + 6 : self.C + 10]
+                + (1 - best_bbox) * predictions[..., self.C + 1 : self.C + 5]
             )
         )
 
-        # Confidence Loss
-        obj_confidence_loss = torch.sum(
-            obj_mask * (best_pred_boxes[..., 4] - 1) ** 2
-        )
-        # noobj_confidence_loss = torch.sum(
-        #     noobj_mask * (best_pred_boxes[..., 4] - 0) ** 2
-        # )
-        # confidence_loss = obj_confidence_loss + self.lambda_noobj * noobj_confidence_loss
-        confidence_loss = obj_confidence_loss
-
-        # Classification Loss
-        class_loss = torch.sum(
-            obj_mask * torch.sum((pred_classes - target_classes_one_hot) ** 2, dim=-1)
+        box_pred[..., 2:4] = torch.sign(box_pred[..., 2:4]) * (
+            torch.sqrt(torch.abs(box_pred[..., 2:4] + 1e-6))
         )
 
-        # Total Loss
-        total_loss = (coord_loss + confidence_loss + class_loss) / batch_size
+        box_target = actual_box * targets[..., self.C + 1 : self.C + 5]
 
-        return total_loss
+        box_target[..., 2:4] = torch.sqrt(box_target[..., 2:4])
 
-    def calculate_iou(self, pred_boxes, target_boxes):
+        # print(torch.flatten(box_pred, end_dim=-2))
+        # print(torch.flatten(box_target, end_dim=-2))
+
+        box_coord_loss = self.mse(
+            torch.flatten(box_pred, end_dim=-2), torch.flatten(box_target, end_dim=-2)
+        )
+
+        # print("box_coord_loss", box_coord_loss)
+
+        # object loss
+        pred_box = (
+            best_bbox * predictions[..., self.C + 5 : self.C + 6]
+            + (1 - best_bbox) * predictions[..., self.C : self.C + 1]
+        )
+
+        obj_loss = self.mse(
+            torch.flatten(actual_box * pred_box),
+            torch.flatten(actual_box * targets[..., self.C : self.C + 1]),
+        )
+
+        # no object loss
+        no_obj_loss = self.mse(
+            torch.flatten(
+                (1 - actual_box) * predictions[..., self.C : self.C + 1], start_dim=1
+            ),
+            torch.flatten(
+                (1 - actual_box) * targets[..., self.C : self.C + 1], start_dim=1
+            ),
+        )
+
+        no_obj_loss += self.mse(
+            torch.flatten(
+                (1 - actual_box) * predictions[..., self.C + 5 : self.C + 6],
+                start_dim=1,
+            ),
+            torch.flatten(
+                (1 - actual_box) * targets[..., self.C : self.C + 1], start_dim=1
+            ),
+        )
+
+        # class loss
+        class_loss = self.mse(
+            torch.flatten((actual_box) * predictions[..., : self.C], end_dim=-2),
+            torch.flatten((actual_box) * targets[..., : self.C], end_dim=-2),
+        )
+
+        loss = (
+            self.lambda_coord * box_coord_loss
+            + obj_loss
+            + self.lambda_noobj * no_obj_loss
+            + class_loss
+        )
+
+        return loss
+
+    def calculate_iou(self, pred_boxes, target_boxes, format = "midpoint"):
         """
         Tính toán Intersection over Union (IoU) giữa các box dự đoán và box thực tế.
 
@@ -93,30 +135,30 @@ class YOLOLoss(nn.Module):
         :param target_boxes: Tensor chứa các bounding box thực tế, shape: (1, 4)
         :return: Tensor chứa giá trị IoU cho mỗi box, shape: (B,)
         """
-        pred_x1 = pred_boxes[..., 0] - pred_boxes[..., 2] / 2
-        pred_y1 = pred_boxes[..., 1] - pred_boxes[..., 3] / 2
-        pred_x2 = pred_boxes[..., 0] + pred_boxes[..., 2] / 2
-        pred_y2 = pred_boxes[..., 1] + pred_boxes[..., 3] / 2
-
-        target_x1 = target_boxes[..., 0] - target_boxes[..., 2] / 2
-        target_y1 = target_boxes[..., 1] - target_boxes[..., 3] / 2
-        target_x2 = target_boxes[..., 0] + target_boxes[..., 2] / 2
-        target_y2 = target_boxes[..., 1] + target_boxes[..., 3] / 2
-
-        # Tính diện tích của các box
-        pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
-        target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
-
-        # Tính diện tích của phần giao nhau
-        inter_x1 = torch.max(pred_x1, target_x1)
-        inter_y1 = torch.max(pred_y1, target_y1)
-        inter_x2 = torch.min(pred_x2, target_x2)
-        inter_y2 = torch.min(pred_y2, target_y2)
-
-        inter_area = torch.max(inter_x2 - inter_x1, torch.tensor(0.0)) * torch.max(inter_y2 - inter_y1, torch.tensor(0.0))
-
-        # Tính IoU
-        union_area = pred_area + target_area - inter_area
-        iou = inter_area / union_area
-
+        if format == "midpoint":
+        
+            box1_x1 = pred_boxes[...,0:1] - pred_boxes[...,2:3]/2
+            box1_x2 = pred_boxes[...,0:1] + pred_boxes[...,2:3]/2
+            box1_y1 = pred_boxes[...,1:2] - pred_boxes[...,3:4]/2
+            box1_y2 = pred_boxes[...,1:2] + pred_boxes[...,3:4]/2
+            
+            box2_x1 = target_boxes[...,0:1] - target_boxes[...,2:3]/2
+            box2_x2 = target_boxes[...,0:1] + target_boxes[...,2:3]/2
+            box2_y1 = target_boxes[...,1:2] - target_boxes[...,3:4]/2
+            box2_y2 = target_boxes[...,1:2] + target_boxes[...,3:4]/2
+            
+            
+        x1 = torch.max(box1_x1, box2_x1)[0]
+        y1 = torch.max(box1_y1, box2_y1)[0]
+        x2 = torch.min(box1_x2, box2_x2)[0]
+        y2 = torch.min(box1_y2, box2_y2)[0]
+        
+        inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+        box1 = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+        box2 = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
+        
+        union = box1 + box2 - inter + 1e-6
+        
+        iou = inter/union
+        
         return iou
