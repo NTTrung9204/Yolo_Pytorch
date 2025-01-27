@@ -9,22 +9,23 @@ def plot_image_with_boxes(images, predictions, class_names=None):
 
     for b in range(batch_size):
         fig, ax = plt.subplots(1, figsize=(8, 8))
-        ax.imshow(images[b].permute(1, 2, 0).cpu().numpy().astype(np.uint8))
+        ax.imshow(images[b].permute(1, 2, 0).numpy().astype(np.uint8))
 
         S = predictions.size(1)  # Grid size
         for i in range(S):
             for j in range(S):
                 # Confidence threshold
-                print(predictions[b, i, j, 4])
-                if predictions[b, i, j, 4] > 0.01:  # Only consider confident predictions
-                    x_center = predictions[b, i, j, 0] * 448
-                    y_center = predictions[b, i, j, 1] * 448
-                    width = predictions[b, i, j, 2] * 448
-                    height = predictions[b, i, j, 3] * 448
+                print(predictions[b, i, j, 1])
+                if predictions[b, i, j, 1] > 0.5:  # Only consider confident predictions
+                    x_center = predictions[b, i, j, 2]
+                    y_center = predictions[b, i, j, 3]
+                    width = predictions[b, i, j, 4] * 448 / 7
+                    height = predictions[b, i, j, 5] * 448 / 7
+                    confident = round(predictions[b, i, j, 1].item(), 2)
                     class_id = 0  # Get class ID
 
-                    x = x_center - width / 2
-                    y = y_center - height / 2
+                    x = (x_center + j) / 7 * 448 - width / 2
+                    y = (y_center + i) / 7 * 448 - height / 2
 
                     # Draw bounding box
                     rect = plt.Rectangle((x, y), width, height, linewidth=2, edgecolor='r', facecolor='none')
@@ -33,6 +34,7 @@ def plot_image_with_boxes(images, predictions, class_names=None):
                     # Add label
                     if class_names:
                         ax.text(x, y, f'{class_names[class_id]}', color='red', fontsize=12)
+                        ax.text(x, y + height, f'{confident}', color='red', fontsize=12)
 
         ax.axis('off')
         plt.show()
@@ -58,4 +60,5 @@ def test_model(model, dataloader, class_names):
 
             # Visualize predictions
             plot_image_with_boxes(images.cpu(), predictions.cpu(), class_names=class_names)
+            # plot_image_with_boxes(images.cpu(), grids.cpu(), class_names=class_names)
             break  # Test 1 batch only
