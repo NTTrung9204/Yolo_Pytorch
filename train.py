@@ -7,7 +7,12 @@ from torch.utils.data import DataLoader
 import os
 from yolo_v1_loss import YOLOLoss
 
-def train_model(model, dataloader, loss_fn, optimizer, num_epochs=10, save_path="yolo_v1_model.pth"):
+from torchvision import transforms
+
+
+def train_model(
+    model, dataloader, loss_fn, optimizer, num_epochs=10, save_path="yolo_v1_model.pth"
+):
     """
     Hàm huấn luyện mô hình YOLOv1.
 
@@ -55,16 +60,26 @@ def train_model(model, dataloader, loss_fn, optimizer, num_epochs=10, save_path=
             #     print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{batch_idx}/{len(dataloader)}], Loss: {loss.item():.4f}")
 
         # Hiển thị loss mỗi epoch
-        print(f"Epoch [{epoch + 1}/{num_epochs}] - Average Loss: {epoch_loss / len(dataloader):.4f}")
+        print(
+            f"Epoch [{epoch + 1}/{num_epochs}] - Average Loss: {epoch_loss / len(dataloader):.4f}"
+        )
 
     # Lưu mô hình sau khi huấn luyện
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
 
+
 if __name__ == "__main__":
     # Đường dẫn dữ liệu
     dataset_images_path = "dataset/train/images/"
     dataset_labels_path = "dataset/train/labels/"
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize(448),
+            transforms.ToTensor(),
+        ]
+    )
 
     annotations_list = []
     images_name_list = []
@@ -76,13 +91,22 @@ if __name__ == "__main__":
         annotations_list.append(dataset_labels_path + annotation)
 
     # Tạo dataset và dataloader
-    my_data = DatasetBuilder(annotations_list=annotations_list, images_list=images_name_list)
+    my_data = DatasetBuilder(
+        annotations_list=annotations_list, images_list=images_name_list, transform=transform
+    )
     my_loader = DataLoader(my_data, batch_size=4, shuffle=True)
 
     # Khởi tạo mô hình, loss, và optimizer
     model = YOLOV1Model(7, 1, 2)
     loss_fn = YOLOLoss(7, 1, 2)
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=0.00005)
 
     # Huấn luyện mô hình
-    train_model(model, my_loader, loss_fn, optimizer, num_epochs=30, save_path="yolo_v1_model.pth")
+    train_model(
+        model,
+        my_loader,
+        loss_fn,
+        optimizer,
+        num_epochs=100,
+        save_path="yolo_v1_model.pth",
+    )
